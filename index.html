@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Camera Talker</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; font-family: system-ui, sans-serif; background:#0e0f13; color:#eee; }
+  main { max-width:720px; margin:0 auto; padding:16px; display:flex; flex-direction:column; gap:12px; }
+  video { width:100%; background:#000; border-radius:12px; aspect-ratio:4/3; object-fit:cover; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+  input, select, button { font:inherit; padding:10px 12px; border-radius:8px; border:1px solid #333; background:#1a1c23; color:#eee; }
+  input[type=password], input[type=text] { flex:1; min-width:180px; }
+  button { cursor:pointer; background:#2d5bff; border-color:#2d5bff; }
+  button.stop { background:#c62f3b; border-color:#c62f3b; }
+  #out { background:#1a1c23; border-radius:12px; padding:12px; min-height:3em; white-space:pre-wrap; }
+  #status { font-size:.85rem; opacity:.7; }
+  label { font-size:.9rem; opacity:.85; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Camera Talker</h1>
+  <video id="video" autoplay playsinline muted></video>
+
+  <div class="row">
+    <input id="key" type="password" placeholder="Gemini API key (stored only on this device)">
+    <button id="saveKey">Save key</button>
+  </div>
+  <div class="row">
+    <input id="prompt" type="text" value="Describe briefly what you see right now in one or two short sentences. Focus on what changed.">
+  </div>
+  <div class="row">
+    <label>Camera
+      <select id="facing"><option value="environment">Back</option><option value="user">Front</option></select>
+    </label>
+    <label>Model
+      <select id="model">
+        <option>gemini-2.5-flash</option>
+        <option>gemini-2.5-flash-lite</option>
+        <option>gemini-2.5-pro</option>
+      </select>
+    </label>
+    <label><input id="mute" type="checkbox"> Mute voice</label>
+  </div>
+  <div class="row">
+    <button id="toggle">Start</button>
+  </div>
+  <div id="status">Idle.</div>
+  <div id="out"></div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const video = $('video'), out = $('out'), statusEl = $('status'), toggle = $('toggle');
+let stream = null, running = false;
+const history = []; // last few spoken lines so it doesn't repeat itself
+
+try { $('key').value = localStorage.getItem('gkey') || ''; } catch (e) {}
+$('saveKey').onclick = () => {
+  try { localStorage.setItem('gkey', $('key').value.trim()); statusEl.textContent = 'Key saved.'; }
+  catch (e) { statusEl.textContent = 'Could not save key (storage blocked); it will be used for this session only.'; }
+};
+
+async function startCamera() {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia || !window.isSecureContext) {
+    throw new Error('Camera is blocked because this page is not served over HTTPS (opening the file directly or over http will not work). Host it on GitHub Pages and open the https:// link.');
+  }
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  stream = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: $('facing').value, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false
+  });
+  video.srcObject = stream;
+  await video.play();
+}
+$('facing').onchange = () => { if (running) startCamera().catch(e => statusEl.textContent = e.message); };
+
+function grabFrame() {
+  const w = 640, h = Math.round(w * (video.videoHeight / video.videoWidth)) || 480;
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  c.getContext('2d').drawImage(video, 0, 0, w, h);
+  return c.toDataURL('image/jpeg', 0.7).split(',')[1];
+}
+
+function speak(text) {
+  return new Promise(resolve => {
+    if ($('mute').checked || !('speechSynthesis' in window)) return resolve();
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.onend = u.onerror = () => resolve();
+    speechSynthesis.speak(u);
+  });
+}
+
+async function describe(b64) {
+  const key = $('key').value.trim();
+  if (!key) throw new Error('Enter your Gemini API key first.');
+  const recent = history.length ? ' You already said: ' + history.slice(-3).join(' | ') + '. Do not repeat yourself; say only what is new or different.' : '';
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${$('model').value}:generateContent`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+      body: JSON.stringify({
+        contents: [{ parts: [
+          { text: $('prompt').value + recent },
+          { inline_data: { mime_type: 'image/jpeg', data: b64 } }
+        ] }]
+      })
+    }
+  );
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error?.message || ('HTTP ' + res.status));
+  return data.candidates?.[0]?.content?.parts?.map(p => p.text).join('').trim() || '';
+}
+
+// Each loop: grab the newest frame -> ask Gemini -> speak -> repeat immediately.
+// Frames that pass while it's thinking/speaking are skipped, so it always reacts to the *current* view.
+async function loop() {
+  while (running) {
+    try {
+      statusEl.textContent = 'Looking…';
+      const text = await describe(grabFrame());
+      if (!running) break;
+      if (text) {
+        out.textContent = text;
+        history.push(text); if (history.length > 6) history.shift();
+        statusEl.textContent = 'Speaking…';
+        await speak(text);
+      }
+    } catch (e) {
+      statusEl.textContent = 'Error: ' + e.message;
+      await new Promise(r => setTimeout(r, 4000)); // back off on errors / rate limits
+    }
+  }
+  statusEl.textContent = 'Stopped.';
+}
+
+toggle.onclick = async () => {
+  if (running) {
+    running = false; speechSynthesis.cancel();
+    toggle.textContent = 'Start'; toggle.classList.remove('stop');
+    return;
+  }
+  try {
+    await startCamera();
+    speechSynthesis.speak(new SpeechSynthesisUtterance('')); // unlock audio on mobile
+    running = true; toggle.textContent = 'Stop'; toggle.classList.add('stop');
+    loop();
+  } catch (e) { statusEl.textContent = 'Camera error: ' + e.message; }
+};
+</script>
+</body>
+</html>
